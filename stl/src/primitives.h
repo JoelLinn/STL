@@ -19,7 +19,7 @@
 #include <concrtinternal.h>
 #endif
 
-enum class __stl_sync_api_modes_enum { normal, win7, vista, concrt };
+enum class __stl_sync_api_modes_enum { workaround, normal, win7, vista, concrt };
 
 extern __stl_sync_api_modes_enum __stl_sync_api_impl_mode;
 
@@ -41,6 +41,134 @@ namespace Concurrency {
             virtual void notify_one()                                            = 0;
             virtual void notify_all()                                            = 0;
             virtual void destroy()                                               = 0;
+        };
+
+        class stl_critical_section_workaround final : public stl_critical_section_interface {
+        public:
+            stl_critical_section_workaround() {
+                m_mutex = CreateMutex(NULL, FALSE, NULL);
+                if (!m_mutex) {
+                    std::terminate();
+                }
+            }
+
+            stl_critical_section_workaround(const stl_critical_section_workaround&) = delete;
+            stl_critical_section_workaround& operator=(const stl_critical_section_workaround&) = delete;
+            ~stl_critical_section_workaround()                                                 = delete;
+
+            virtual void destroy() override {
+                if (!CloseHandle(m_mutex)) {
+                    std::terminate();
+                }
+            }
+
+            virtual void lock() override {
+                if (!stl_critical_section_workaround::try_lock_for(INFINITE)) {
+                    std::terminate();
+                }
+            }
+
+            virtual bool try_lock() override {
+                return stl_critical_section_workaround::try_lock_for(0);
+            }
+
+            virtual bool try_lock_for(unsigned int ms) override {
+                DWORD ret = WaitForSingleObject(m_mutex, ms);
+                switch (ret) {
+                case WAIT_OBJECT_0:
+                    return true;
+                case WAIT_TIMEOUT:
+                    return false;
+                case WAIT_ABANDONED:
+                case WAIT_FAILED:
+                default:
+                    std::terminate();
+                }
+            }
+
+            virtual void unlock() override {
+                if (!ReleaseMutex(m_mutex)) {
+                    std::terminate();
+                }
+            }
+
+            HANDLE native_handle() {
+                return m_mutex;
+            }
+
+        private:
+            HANDLE m_mutex;
+        };
+
+        class stl_condition_variable_workaround final : public stl_condition_variable_interface {
+        public:
+            stl_condition_variable_workaround() {
+                m_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+                if (!m_event) {
+                    std::terminate();
+                }
+            }
+
+            ~stl_condition_variable_workaround()                                        = delete;
+            stl_condition_variable_workaround(const stl_condition_variable_workaround&) = delete;
+            stl_condition_variable_workaround& operator=(const stl_condition_variable_workaround&) = delete;
+
+            virtual void destroy() override {}
+
+            virtual void wait(stl_critical_section_interface* lock) override {
+                if (!stl_condition_variable_workaround::wait_for(lock, INFINITE)) {
+                    std::terminate();
+                }
+            }
+
+            virtual bool wait_for(stl_critical_section_interface* lock, unsigned int timeout) override {
+                DWORD ret;
+                {
+                    // This operation should be atomic, but yeah...
+                    lock->unlock();
+                    waiting++;
+                    ret = WaitForSingleObject(m_event, timeout);
+                    waiting--;
+                    lock->lock();
+                }
+                switch (ret) {
+                case WAIT_OBJECT_0:
+                    return true;
+                case WAIT_TIMEOUT:
+                    return false;
+                case WAIT_ABANDONED:
+                case WAIT_FAILED:
+                default:
+                    std::terminate();
+                }
+            }
+
+            virtual void notify_one() override {
+                if (!waiting) {
+                    return;
+                }
+                if (!SetEvent(m_event)) {
+                    std::terminate();
+                }
+            }
+
+            virtual void notify_all() override {
+                size_t count = waiting;
+                if (!count) {
+                    return;
+                }
+                // Wow this is terrible.
+                do {
+                    count = waiting; // copy
+                    if (!SetEvent(m_event)) {
+                        std::terminate();
+                    }
+                } while (count > 1);
+            }
+
+        private:
+            HANDLE m_event;
+            std::atomic<size_t> waiting = 0;
         };
 
         class stl_critical_section_vista final : public stl_critical_section_interface {
@@ -290,6 +418,9 @@ namespace Concurrency {
             new (p) stl_critical_section_win7;
 #else
             switch (__stl_sync_api_impl_mode) {
+            case __stl_sync_api_modes_enum::workaround:
+                new (p) stl_critical_section_workaround;
+                return;
             case __stl_sync_api_modes_enum::normal:
             case __stl_sync_api_modes_enum::win7:
                 if (are_win7_sync_apis_available()) {
@@ -320,6 +451,9 @@ namespace Concurrency {
             new (p) stl_condition_variable_win7;
 #else
             switch (__stl_sync_api_impl_mode) {
+            case __stl_sync_api_modes_enum::workaround:
+                new (p) stl_condition_variable_workaround;
+                return;
             case __stl_sync_api_modes_enum::normal:
             case __stl_sync_api_modes_enum::win7:
                 if (are_win7_sync_apis_available()) {
@@ -352,26 +486,34 @@ namespace Concurrency {
         const size_t stl_condition_variable_max_alignment = __alignof(stl_condition_variable_win7);
 #elif defined _STL_CONCRT_SUPPORT
         const size_t stl_critical_section_max_size =
-            __max(__max(sizeof(stl_critical_section_concrt), sizeof(stl_critical_section_vista)),
-                sizeof(stl_critical_section_win7));
+            __max(__max(__max(sizeof(stl_critical_section_concrt), sizeof(stl_critical_section_vista)),
+                      sizeof(stl_critical_section_win7)),
+                sizeof(stl_critical_section_workaround));
         const size_t stl_condition_variable_max_size =
-            __max(__max(sizeof(stl_condition_variable_concrt), sizeof(stl_condition_variable_vista)),
-                sizeof(stl_condition_variable_win7));
+            __max(__max(__max(sizeof(stl_condition_variable_concrt), sizeof(stl_condition_variable_vista)),
+                      sizeof(stl_condition_variable_win7)),
+                sizeof(stl_condition_variable_workaround));
         const size_t stl_critical_section_max_alignment =
-            __max(__max(__alignof(stl_critical_section_concrt), __alignof(stl_critical_section_vista)),
-                __alignof(stl_critical_section_win7));
+            __max(__max(__max(__alignof(stl_critical_section_concrt), __alignof(stl_critical_section_vista)),
+                      __alignof(stl_critical_section_win7)),
+                __alignof(stl_critical_section_workaround));
         const size_t stl_condition_variable_max_alignment =
-            __max(__max(__alignof(stl_condition_variable_concrt), __alignof(stl_condition_variable_vista)),
-                __alignof(stl_condition_variable_win7));
+            __max(__max(__max(__alignof(stl_condition_variable_concrt), __alignof(stl_condition_variable_vista)),
+                      __alignof(stl_condition_variable_win7)),
+                __alignof(stl_condition_variable_workaround));
 #else
         const size_t stl_critical_section_max_size =
-            __max(sizeof(stl_critical_section_vista), sizeof(stl_critical_section_win7));
+            __max(__max(sizeof(stl_critical_section_vista), sizeof(stl_critical_section_win7)),
+                sizeof(stl_critical_section_workaround));
         const size_t stl_condition_variable_max_size =
-            __max(sizeof(stl_condition_variable_vista), sizeof(stl_condition_variable_win7));
+            __max(__max(sizeof(stl_condition_variable_vista), sizeof(stl_condition_variable_win7)),
+                sizeof(stl_condition_variable_workaround));
         const size_t stl_critical_section_max_alignment =
-            __max(__alignof(stl_critical_section_vista), __alignof(stl_critical_section_win7));
+            __max(__max(__alignof(stl_critical_section_vista), __alignof(stl_critical_section_win7)),
+                __alignof(stl_critical_section_workaround));
         const size_t stl_condition_variable_max_alignment =
-            __max(__alignof(stl_condition_variable_vista), __alignof(stl_condition_variable_win7));
+            __max(__max(__alignof(stl_condition_variable_vista), __alignof(stl_condition_variable_win7)),
+                __alignof(stl_condition_variable_workaround));
 #endif
     } // namespace details
 } // namespace Concurrency

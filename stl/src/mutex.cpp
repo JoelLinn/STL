@@ -31,7 +31,7 @@ extern "C" _CRTIMP2_PURE void _Thrd_abort(const char* msg) { // abort on precond
 #define _THREAD_ASSERT(expr, msg) ((void) 0)
 #endif // _THREAD_CHECKX
 
-__stl_sync_api_modes_enum __stl_sync_api_impl_mode = __stl_sync_api_modes_enum::normal;
+__stl_sync_api_modes_enum __stl_sync_api_impl_mode = __stl_sync_api_modes_enum::workaround;
 
 extern "C" _CRTIMP2 void __cdecl __set_stl_sync_api_mode(__stl_sync_api_modes_enum mode) {
     __stl_sync_api_impl_mode = mode;
